@@ -1,0 +1,394 @@
+=====================================================================
+ REGISTRO DE PRODUCTOS - SISTEMA CHANNELS (Backend Go + App Flutter)
+=====================================================================
+ Proyectos involucrados:
+   - Backend  : channels\backendgo  (Go / Fiber / GORM / MySQL)
+   - App Flutter : channels\appchantres (Dio, Provider, SharedPreferences)
+
+ Archivos clave:
+   BACKEND:
+     - productos\producto.controller.go
+     - productos\producto.model.go
+     - productos\productos.routes.go
+     - utils\upload.go            (guarda archivos de imagen)
+     - database\database.go       (conexión a MySQL)
+   FLUTTER:
+     - lib\widgets\product\product_form_modal.dart   (formulario 3 pasos)
+     - lib\paginas\productos_screen.dart             (pantalla + guardado)
+     - lib\servicios\producto_service.dart           (llamadas API)
+     - lib\servicios\pending_upload_service.dart     (reintentos/cola)
+     - lib\models\producto.dart / product_form_data.dart
+     - lib\api.dart                 (URL del servidor)
+     - lib\servicios\api_service.dart (Dio, tokens, timeouts)
+=====================================================================
+
+
+=====================================================================
+ 1. FLUJO COMPLETO DEL REGISTRO DE PRODUCTO
+=====================================================================
+
+ 1) El usuario abre la pantalla "Productos" (productos_screen.dart).
+    - Carga categorías, proveedores, sucursales y productos desde el
+      backend (o del servidor local si está conectado).
+
+ 2) Toca el botón flotante "Nuevo" -> se abre el modal ProductForm
+    (product_form_modal.dart), un formulario de 3 pasos:
+
+    PASO 1 - Información:
+       - Código principal (se puede escanear o generar automático)
+       - Nombre del producto            (OBLIGATORIO)
+       - Descripción
+       - Categoría                      (OBLIGATORIO)
+       - Proveedor                      (OBLIGATORIO)
+       - Validación de código duplicado (avisa si ya existe en otro
+         producto, pero NO bloquea)
+
+    PASO 2 - Inventario:
+       - Interruptor "Gestión Multi-Sucursal"
+       - Stock actual / distribución por sucursal
+       - Precio de venta                (OBLIGATORIO)
+       - Costo                          (OBLIGATORIO)
+       - Fecha de caducidad (opcional)
+       - Modo "¿Tiene Colores?" (paleta de colores)
+       - Modo Series/Únicos (escaneo de un código por cada ítem)
+
+    PASO 3 - Multimedia:
+       - Fotos (cámara o galería, máximo 5)
+       - Vista previa del código de barras (Code128 / QR)
+
+ 3) Al pulsar "Guardar Producto", _submit() hace validación manual:
+       - Nombre no vacío
+       - Precio de venta no vacío
+       - Costo no vacío
+       - Categoría seleccionada
+       - Proveedor seleccionado
+       - Stock no vacío
+
+ 4) Se arma el Map<String,dynamic> "formData" con:
+       nombre, descripcion, costo, precio_venta, stock,
+       proveedor_id, categoria_id, id_sucursal, codigo_barras,
+       fecha_caducidad (YYYY-MM-DD), colores (JSON), y en modo
+       multi-sucursal: crear_maestro=true y distribuciones=[...].
+
+ 5) onSave (en productos_screen.dart) procesa el guardado:
+       a) Si hay imágenes -> las comprime a WebP (utils\image_compress)
+       b) Determina el modo de subida:
+            - 'distribucion' : hay distribuciones y NO es edición
+            - 'editar'       : es edición (PUT /api/productos/:id)
+            - 'local'        : conectado a servidor local
+            - 'simple'       : POST /api/productos normal
+       c) Guarda la subida como PENDIENTE (SharedPreferences + copia
+          de las imágenes comprimidas en Documents/pending_uploads).
+          Esto permite reintentar sin perder datos.
+       d) Envía al backend con reintentos (3 intentos, backoff
+          exponencial 1s, 2s, 4s). El FormData se reconstruye en
+          cada intento porque los streams de archivo solo se leen
+          una vez.
+       e) Éxito  -> elimina pendiente, notificación "Producto
+                    registrado/actualizado exitosamente".
+          Error -> guarda lastError en la subida pendiente y muestra
+                   notificación con botón de reintento.
+
+ 6) El backend procesa (producto.controller.go):
+       - POST /api/productos            -> CrearProducto (simple)
+       - POST /api/productos/distribucion-> CrearProductoConDistribucion
+       - PUT  /api/productos/:id        -> ActualizarProducto
+       - DELETE /api/productos/:id      -> EliminarProducto
+
+---------------------------------------------------------------------
+ 2. ENDPOINTS DEL BACKEND (productos.routes.go)
+---------------------------------------------------------------------
+   GET    /api/productos                 Lista (filtro ?id_sucursal=
+                                           paginación ?page=&limit=)
+   GET    /api/productos/:id             Detalle con siblings y stock
+                                           global por código de barras
+   POST   /api/productos                 Crear producto simple
+   POST   /api/productos/distribucion    Crear producto con distribución
+                                           multi-sucursal (+ maestro)
+   PUT    /api/productos/:id             Actualizar (actualiza hermanos
+                                           con el mismo código de barras)
+   DELETE /api/productos/:id             Eliminar (borra imagenes,
+                                           codigos, variantes)
+   GET    /api/productos-maestros        Lista de maestros
+   GET    /api/productos-maestros/:id    Detalle de maestro
+   GET    /api/codigos/buscar/:codigo    Búsqueda unificada por código
+                                           (barras o alternativo)
+   POST   /api/productos/:id/imagenes    Agregar imágenes adicionales
+
+   El backend acepta JSON y multipart/form-data. En multipart, los
+   objetos JSON (colores, distribuciones, codigos_alternativos,
+   variantes, imagenes_eliminar) viajan como strings y el controlador
+   los parsea manualmente.
+
+---------------------------------------------------------------------
+ 3. TABLAS / MODELOS (producto.model.go)
+---------------------------------------------------------------------
+   producto_maestros   -> ProductoMaestro (nombre, descripcion_base,
+                          imagen_compartida, proveedor_id, categoria_id,
+                          activo)
+   productos           -> Producto (nombre, descripcion, costo,
+                          precio_venta, stock, fecha_caducidad,
+                          codigo_barras, colores JSON, imagen,
+                          proveedor_id, categoria_id, id_sucursal,
+                          producto_maestro_id)
+   producto_imagenes   -> ProductoImagen (producto_id, ruta_imagen,
+                          es_principal, orden)
+   producto_codigos    -> ProductoCodigo (producto_id, codigo, tipo,
+                          es_principal)
+   producto_variantes  -> ProductoVariante (producto_id, color,
+                          cantidad, imagen_url, activo)
+=====================================================================
+
+
+=====================================================================
+ 4. ERRORES DEL REGISTRO DE PRODUCTOS
+=====================================================================
+
+---------------------------------------------------------------------
+ A) VALIDACIÓN EN LA APP (Flutter - product_form_modal.dart)
+    Estos errores se muestran ANTES de enviar al servidor:
+---------------------------------------------------------------------
+   1. "El nombre es obligatorio"           -> si nombre vacío
+   2. "El precio de venta es obligatorio"  -> si precio_venta vacío
+   3. "El costo es obligatorio"            -> si costo vacío
+   4. "Seleccione una categoría"           -> si no hay categoría
+   5. "Seleccione un proveedor"            -> si no hay proveedor
+   6. "El stock es obligatorio"            -> si stock vacío
+   7. "Sin stock disponible"               -> al intentar sumar más
+                                              unidades de las que hay
+                                              en la distribución
+   8. Aviso "Ya existe en: <producto>"     -> código de barras ya
+                                              registrado en otro
+                                              producto (informativo,
+                                              NO bloquea)
+   9. "Cámara no disponible. Use la galería." -> error al abrir cámara
+  10. "Se perderán los cambios no guardados." -> al cancelar con datos
+
+---------------------------------------------------------------------
+ B) ERRORES DE CONEXIÓN / RED (pending_upload_service.dart)
+    Se muestran cuando falla la subida, y quedan pendientes de
+    reintento:
+---------------------------------------------------------------------
+   1. "Sin conexión a internet"        -> DioExceptionType.connectionError
+   2. "Tiempo de espera agotado"       -> connectionTimeout / receiveTimeout
+   3. "Error del servidor (HTTP <codigo>)" -> respuesta del servidor
+   4. "Error de conexión"              -> cualquier otro error de red
+   5. "Error inesperado: <detalle>"    -> excepción no controlada
+   6. "Error enviando al servidor local" -> fallo al usar servidor local
+
+---------------------------------------------------------------------
+ C) ERRORES DEL BACKEND (Go - producto.controller.go)
+---------------------------------------------------------------------
+
+  C.1) Crear producto con distribución (POST /productos/distribucion)
+
+    400 - "Debe incluir al menos una distribución"
+          Cuando el campo 'distribuciones' viene vacío o no es un
+          array válido.
+          Hint: "Verifique que el campo 'distribuciones' sea un array
+          JSON válido"
+
+    400 - "Formato inválido en distribuciones"
+          Cuando el JSON de 'distribuciones' no se puede parsear.
+
+    500 - "Error al crear producto maestro: <detalle>"
+          Fallo de BD al insertar en producto_maestros (rollback).
+
+    500 - "Error al crear instancia de producto: <detalle>"
+          Fallo de BD al insertar en productos (rollback).
+
+    500 - "Error al confirmar la transacción: <detalle>"
+          Fallo en el commit.
+
+  C.2) Crear producto simple (POST /productos)
+
+    500 - "Error al crear producto"
+          Fallo de BD al insertar el producto (rollback).
+
+  C.3) Actualizar producto (PUT /productos/:id)
+
+    404 - "Producto no encontrado"
+          Cuando no existe el id indicado.
+
+    500 - "Error al actualizar productos hermanos"
+          Fallo al actualizar por código de barras (rollback).
+
+  C.4) Eliminar producto (DELETE /productos/:id)
+
+    404 - "Producto no encontrado"
+
+    409 - "No se puede eliminar: tiene ventas o registros asociados."
+          MySQL error 1451 / "foreign key constraint fails" -> el
+          producto tiene ventas, boletas u otros registros vinculados.
+
+    500 - "Error al eliminar el producto: <detalle>"
+          Otro error de BD.
+
+  C.5) Obtener producto / maestro
+
+    404 - "No encontrado"          (producto maestro)
+    404 - "Producto no encontrado" (producto)
+
+  C.6) Búsqueda por código (GET /codigos/buscar/:codigo)
+
+    404 - "No encontrado"  -> el código no está en codigo_barras ni
+                              en producto_codigos.
+
+  C.7) Imágenes (POST /productos/:id/imagenes)
+
+    400 - "Error en el formulario: <detalle>"
+    400 - "No se enviaron imágenes"
+
+  C.8) Imagen principal en creación/actualización
+
+    La imagen es OPCIONAL: si no se sube, el backend solo hace un
+    warning en consola "[WARN] No se subió imagen" y continúa.
+    El campo 'imagen' viaja como multipart bajo el nombre "imagen".
+
+---------------------------------------------------------------------
+ D) ERRORES ADICIONALES RECOMENDADOS / QUE FALTAN
+    (sugerencias de validaciones que debería tener el sistema)
+---------------------------------------------------------------------
+
+ 1. Código de barras duplicado (debería rechazar):
+      -> backend no valida duplicados; dos productos pueden quedar con
+         el mismo codigo_barras. Sugerencia:
+           409 - "El código de barras ya está registrado"
+
+ 2. Precio de venta menor que costo (debería avisar):
+      -> se permite vender por debajo del costo. Sugerencia: warning
+         "El precio de venta es menor que el costo"
+
+ 3. Fecha de caducidad en el pasado (debería avisar):
+      -> solo se valida formato (2006-01-02). Sugerencia:
+         "La fecha de caducidad no puede ser anterior a hoy"
+
+ 4. Distribución que no cuadra con el stock total:
+      -> en _submit() hay una validación comentada
+         (totalAssigned != totalStock). Se debería activar para evitar
+         pérdida de stock:
+            "El stock distribuido (X) no coincide con el stock total (Y)"
+
+ 5. Sin sucursal seleccionada en modo simple:
+      -> si id_sucursal es 0 o nulo, el backend guarda producto sin
+         sucursal. Sugerencia:
+            400 - "Debe seleccionar una sucursal"
+
+ 6. Proveedor/Categoría inexistentes:
+      -> el backend asigna por defecto ProveedorID=1 y CategoriaID=1
+         cuando vienen en 0 (ver CrearProductoConDistribucion).
+         Sugerencia: validar que existan antes de insertar.
+
+ 7. Sin nombre:
+      -> el backend usa "Producto sin nombre" como fallback.
+         Sugerencia: rechazar con 400 "El nombre es obligatorio"
+         (la app ya lo valida, el backend no).
+
+ 8. Cantidades negativas o no numéricas:
+      -> no se valida que cantidad >= 0. Sugerencia:
+            400 - "La cantidad no puede ser negativa"
+
+ 9. Timeouts de imagen:
+      -> el backend usa utils.SaveUploadedFile; si el archivo es muy
+         grande o no es imagen, se ignora silenciosamente. Sugerencia:
+           400 - "El archivo no es una imagen válida"
+
+ 10. Subidas con reintentos:
+      -> la app reintenta 3 veces (1s/2s/4s) con el mismo FormData.
+         Si el error es 400/409 (dato inválido) no tiene sentido
+         reintentar; se debería distinguir entre errores retryable
+         (500, timeout, red) y no retryable (400, 409).
+
+---------------------------------------------------------------------
+ E) MENSAJES DE ÉXITO
+---------------------------------------------------------------------
+   App:
+     - "Producto registrado exitosamente"   (creación)
+     - "Producto actualizado exitosamente"  (edición)
+     - "Producto eliminado correctamente"   (borrado)
+     - "Traslado realizado con éxito"       (transferencia)
+     - "Productos cargados del servidor local" / "de la nube"
+   Backend:
+     - 201 "Productos distribuidos correctamente" (data con
+       producto_maestro_id y productos)
+     - 201 <Producto> (creación simple)
+     - 200 "Producto actualizado correctamente"
+     - 200 "Producto eliminado correctamente"
+=====================================================================
+
+
+=====================================================================
+ 5. CÓMO SE CONSTRUYE EL FORMData (Flutter -> Backend)
+=====================================================================
+ pending_upload_service.buildFormData():
+   - Cada campo del formFields se envía como string.
+   - Los campos tipo List se envían con jsonEncode().
+   - Se omite 'imagen' e 'imagenes_adicionales' de formFields.
+   - Se omite fecha_caducidad vacía o "null".
+   - La primera imagen va en el campo "imagen".
+   - Las demás van como "imagenes_adicionales".
+
+ Campos que recibe el backend:
+   - nombre (string)
+   - descripcion (string)
+   - costo (decimal)
+   - precio_venta (decimal)
+   - stock (int)
+   - proveedor_id (int)
+   - categoria_id (int)
+   - id_sucursal (int)
+   - codigo_barras (string)  (si vacío el backend genera PROD-<epoch>)
+   - fecha_caducidad (YYYY-MM-DD)
+   - colores (JSON array de hex)
+   - distribuciones (JSON array) con:
+        id_sucursal, cantidad, codigo_barras,
+        codigos_alternativos[{codigo, tipo}], variantes[{color, cantidad}]
+   - crear_maestro ("true"/"false")
+   - imagenes_eliminar (JSON array)  [solo edición]
+   - imagen (archivo)
+=====================================================================
+
+
+=====================================================================
+ 6. OBSERVACIONES / BUGS ENCONTRADOS EN EL CÓDIGO ACTUAL
+=====================================================================
+  1. En product_form_modal.dart _initializeApp() se llama
+     _loadDraft() DOS veces:
+        await _loadDraft();
+        await _loadDraft();   <-- duplicado
+     Se debería eliminar una llamada.
+
+  2. En el backend, CrearProductoConDistribucion asigna
+     ProveedorID=1 y CategoriaID=1 por defecto si vienen en 0.
+     Esto puede crear productos con datos incorrectos.
+
+  3. En ActualizarProducto, si NO se envía distribuciones, se hace
+     tx.Model(&producto).Update("stock", body.Stock) pero body.Stock
+     no está en el struct del body (usa solo Stock de distribuciones).
+     El struct del body NO incluye el campo Stock. Revisar.
+
+  4. En ActualizarProducto, el campo "colores" con multipart se
+     asigna directo (json.RawMessage(val)) sin normalizar como en
+     CrearProducto (si no empieza con "[" se debería envolver).
+
+  5. En productos_screen.dart _showProductModal, al editar un
+     producto multi-sucursal agrupado, el producto llega agrupado
+     (sucursales_info) y no se manda el id correcto del hermano a
+     editar; la edición por código de barras actualiza TODOS los
+     hermanos con ese código (comportamiento intencional del backend).
+
+  6. El modo de subida 'local' envía la imagen sin comprimir
+     (usa imagenFiles[0] original) mientras el modo nube la comprime
+     a WebP.
+
+  7. _scannedSerials y _branchSerialsMap pueden quedar desconectados
+     si se activa/desactiva el modo series; verificar que el stock
+     final siempre corresponda a la distribución enviada.
+
+  8. La validación del código duplicado (verificarCodigoEnOtroProducto)
+     depende del endpoint /api/codigos/buscar/:codigo. Si el backend
+     está caído, devuelve null y no avisa (fallo silencioso).
+
+=====================================================================
+ FIN DEL DOCUMENTO
+=====================================================================
