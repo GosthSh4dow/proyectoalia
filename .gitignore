@@ -1,0 +1,10 @@
+# Excluidos: uploads con imagenes y zips (a pedido del usuario) + secretos
+*.zip
+backend/uploads/*
+!backend/uploads/.gitkeep
+backend/.env
+backend/env
+*.sqlite
+node_modules/
+.DS_Store
+appchantres/android/
